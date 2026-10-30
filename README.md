@@ -21,3 +21,9 @@ Python 3.10 or later, standard library only:
 ## Note
 This is a teaching sketch, not production code. In production, pair it with
 isolation, least-privilege tokens, signed ledger entries, and an append-only store.
+
+   ## The Agent Institutions series
+
+   - **Part 1: Every Agent Action Needs a Reason.** Decision provenance and enforcement at the moment of action. Code: `decision_gate.py` (repository root).
+   - **Part 2: The PMO Is Becoming a Control Plane.** Charters as code, stage gates, escrowed budgets, earned value, and reconciliation. Code: [`control-plane/`](control-plane/)
+   - **Part 3: Measuring an Agent Institution.** Coming next.
