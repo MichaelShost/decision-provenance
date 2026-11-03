@@ -157,13 +157,68 @@ class TestEvmAndReconcile(unittest.TestCase):
         self.assertEqual((m["PV"], m["EV"], m["AC"]), (D("400"), D("400"), D("40")))
         self.assertEqual(m["CPI"], D("10"))
 
-    def test_reconcile_finds_gate_debt_and_releases_orphans(self):
+    def test_reconcile_finds_gate_debt_and_releases_confirmed_orphans(self):
         cp, _, child = plane()
+        cp.system_of_record = lambda rid: D("0")  # system of record confirms nothing was spent
         cp.authorize("ag", "KID", child.digest, "a", D("10"), 1)  # reserved, never completed
         kinds = {k for k, _, _ in cp.reconcile(now=9)}
         self.assertIn("GATE_DEBT", kinds)
         self.assertIn("ORPHAN_RESERVATION", kinds)
         self.assertEqual(cp.records["ROOT"].reserved, D("0"))
+
+
+class TestInDoubt(unittest.TestCase):
+    """Timeouts don't release money. Evidence does."""
+
+    def timed_out(self, amount="40"):
+        cp, _, child = plane()
+        _, _, rid = cp.authorize("ag", "KID", child.digest, "a", D(amount), 1)
+        return cp, child, rid  # the agent never confirms
+
+    def test_timeout_never_frees_budget(self):
+        cp, _, rid = self.timed_out()
+        findings = cp.reconcile(now=3)  # lease expired, no evidence available
+        self.assertIn(("IN_DOUBT", "KID", f"{rid} unconfirmed: held as spent"), findings)
+        self.assertEqual(cp.records["KID"].reserved, D("40"))
+        self.assertEqual(cp.records["ROOT"].reserved, D("40"))
+
+    def test_stopped_charter_does_not_release_without_evidence(self):
+        cp, _, rid = self.timed_out()
+        cp.suspend("KID", "pause")
+        cp.reconcile(now=1)
+        self.assertIn(rid, cp.in_doubt)
+        self.assertEqual(cp.records["KID"].reserved, D("40"))
+
+    def test_unresolved_escalates_to_owner(self):
+        cp, _, rid = self.timed_out()
+        cp.reconcile(now=3)
+        kinds = {k for k, _, _ in cp.reconcile(now=5)}
+        self.assertIn("IN_DOUBT_ESCALATED", kinds)
+
+    def test_system_of_record_commits_actual_cost(self):
+        cp, _, rid = self.timed_out()
+        cp.reconcile(now=3)
+        cp.system_of_record = lambda r: D("37")
+        kinds = {k for k, _, _ in cp.reconcile(now=4)}
+        self.assertIn("IN_DOUBT_RESOLVED", kinds)
+        self.assertEqual((cp.records["KID"].committed, cp.records["KID"].reserved), (D("37"), D("0")))
+
+    def test_late_retry_is_never_booked_twice(self):
+        cp, _, rid = self.timed_out()
+        cp.system_of_record = lambda r: D("37")
+        cp.reconcile(now=3)
+        cp.commit(rid, D("37"))  # the agent finally confirms, after resolution
+        self.assertEqual(cp.records["ROOT"].committed, D("37"))
+        self.assertEqual(cp.ledger.entries[-1]["kind"], "outcome.duplicate")
+
+    def test_in_doubt_exposure_is_capped_per_agent(self):
+        cp, child, rid = self.timed_out("40")
+        cp.in_doubt_cap = D("40")
+        cp.reconcile(now=3)
+        v, why, _ = cp.authorize("ag", "KID", child.digest, "a", D("1"), 3)
+        self.assertEqual((v, why), (Verdict.DENY, "in-doubt exposure cap reached: resolve before new spend"))
+        self.assertEqual(cp.authorize("other", "ROOT", cp.records["ROOT"].charter.digest, "a", D("1"), 3)[0],
+                         Verdict.ALLOW)
 
 
 class TestLedger(unittest.TestCase):

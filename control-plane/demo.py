@@ -128,3 +128,23 @@ print("\n8. Tamper evidence")
 print(f"  ledger entries {len(cp.ledger.entries)}, chain verifies: {cp.ledger.verify()}")
 cp.ledger.entries[5]["reason"] = "rewritten after the fact"
 print(f"  after editing one historical entry, chain verifies: {cp.ledger.verify()}")
+
+print("\n9. Timeouts don't release money. Evidence does. (v1.1)")
+records = {}  # stand-in for the tool's system of record, keyed by idempotency key
+cp2 = ControlPlane(people, in_doubt_cap=D("25"), system_of_record=lambda rid: records.get(rid))
+ops = Charter("CH-200", 1, "Vendor data refresh", "Refresh supplier records nightly", "dana.owner",
+              frozenset({"call.api"}), budget=D("100"), escalate_above=D("50"), expires=30, phases=())
+cp2.issue(ops, sign(KEYS["dana.owner"], ops.body()))
+_, _, rid = cp2.authorize("agent.sync", "CH-200", ops.digest, "call.api", D("25"), now=1)
+print(f"  agent.sync reserves $25 as {rid}, then times out and never confirms")
+for kind, cid, detail in cp2.reconcile(now=3):
+    print(f"  day 3  {kind:<20} {detail}")
+print(f"  CH-200 still encumbered: ${cp2.records['CH-200'].reserved} held as spent, nothing released")
+show("agent.sync tries new spend while in doubt",
+     cp2.authorize("agent.sync", "CH-200", ops.digest, "call.api", D("5"), now=3))
+records[rid] = D("22")  # the provider's ledger shows the call did happen
+for kind, cid, detail in cp2.reconcile(now=4):
+    print(f"  day 4  {kind:<20} {detail}")
+cp2.commit(rid, D("22"))  # the agent's late retry arrives
+print(f"  late retry from agent.sync: booked once, spent {cp2.records['CH-200'].committed} "
+      f"(ledger: {cp2.ledger.entries[-1]['kind']})")

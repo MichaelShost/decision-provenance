@@ -32,11 +32,11 @@ The idea in one sentence: **delivery governance already contains the controls ag
 Requires Python 3.10 or later. Standard library only, no installs.
 
 ```bash
-python demo.py               # eight scenarios, end to end
-python -m unittest -v        # 14 tests
+python demo.py               # nine scenarios, end to end
+python -m unittest -v        # 20 tests
 ```
 
-The demo walks through delegation that cannot widen, agent self-chartering rejected, graded verdicts, change control that invalidates stale versions, stage gates with separation of duties, forty agents racing for one budget, parent suspension cascading to children, continuous earned value with reconciliation findings, and tamper detection.
+The demo walks through delegation that cannot widen, agent self-chartering rejected, graded verdicts, change control that invalidates stale versions, stage gates with separation of duties, forty agents racing for one budget, parent suspension cascading to children, continuous earned value with reconciliation findings, tamper detection, and a timed-out action held in doubt until the system of record resolves it.
 
 ## The concurrency proof
 
@@ -48,6 +48,17 @@ The most common agent budget check is *check, then spend*. Under parallel agents
 | Escrow reservation | 10 | $300 |
 
 See `TestBudgets` in `test_control_plane.py`. If your agent framework has never run this test, assume it is exposed.
+
+## Timeouts don't release money. Evidence does. (v1.1)
+
+What happens when an agent reserves budget, acts, then times out and never confirms whether it actually spent? Releasing the reservation on silence would reintroduce the overspend race the escrow exists to prevent. So unknown is treated as spent:
+
+- **Idempotency key.** The reservation ID travels with the action, so a retry can never be booked twice and the outcome can be looked up later.
+- **IN_DOUBT, not released.** When a reservation's lease expires, or its charter stops, it moves to `IN_DOUBT` and stays encumbered. The reconciler queries the system of record by that key, then commits at actual cost or releases only on evidence that nothing was spent.
+- **Bounded exposure.** In-doubt exposure is capped per agent and per charter. An agent at its cap is denied new spend until its open outcomes are resolved.
+- **Escalation.** Anything that stays unresolved escalates to the charter's accountable owner.
+
+See scenario 9 in `demo.py` and `TestInDoubt` in `test_control_plane.py`. Thanks to Kiran Yenaganti, whose question about agents that time out mid-action prompted this revision.
 
 ## What this is, and is not
 
@@ -62,9 +73,9 @@ This is a reference implementation written for clarity, not a production library
 
 | File | Purpose |
 |---|---|
-| `control_plane.py` | The control plane (about 380 lines) |
+| `control_plane.py` | The control plane (about 430 lines) |
 | `demo.py` | Scenario walkthrough used in the article |
-| `test_control_plane.py` | 14 tests, including the concurrency proof |
+| `test_control_plane.py` | 20 tests, including the concurrency proof and in-doubt handling |
 
 ## The series
 

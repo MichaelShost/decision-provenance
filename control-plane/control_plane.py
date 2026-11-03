@@ -14,6 +14,8 @@ What it adds:
   5. Earned value for agent work (PV, EV, AC, CPI, SPI, EAC)
   6. A reconciliation loop that compares declared intent with observed behavior
   7. A hash-chained, tamper-evident ledger
+  8. In-doubt handling: a timed-out action is treated as spent until evidence
+     from the system of record says otherwise (v1.1)
 
 Standard library only. HMAC stands in for asymmetric signatures to keep the
 example dependency free; use Ed25519 or an HSM-backed key in production.
@@ -160,7 +162,9 @@ class Ledger:
 
 # ------------------------------------------------------------ control plane
 class ControlPlane:
-    def __init__(self, principals: Principals, max_depth: int = 3):
+    def __init__(self, principals: Principals, max_depth: int = 3, lease_days: int = 1,
+                 in_doubt_cap: Decimal = Decimal("100"), escalate_after: int = 2,
+                 system_of_record=None):
         self.principals = principals
         self.ledger = Ledger()
         self.records: dict[str, Record] = {}
@@ -168,6 +172,15 @@ class ControlPlane:
         self.max_depth = max_depth
         self._lock = threading.Lock()
         self._seq = 0
+        # In-doubt handling (v1.1). The reservation ID doubles as the idempotency key
+        # the action carries to the tool, so its outcome can be looked up later.
+        self.lease_days = lease_days
+        self.in_doubt_cap = in_doubt_cap
+        self.escalate_after = escalate_after
+        self.system_of_record = system_of_record  # rid -> actual cost, ZERO if not spent, None if unknown
+        self.leases: dict[str, dict] = {}
+        self.in_doubt: dict[str, int] = {}
+        self.settled: dict[str, tuple] = {}
 
     # -- lineage helpers
     def _chain(self, charter_id: str) -> list[Record]:
@@ -256,11 +269,15 @@ class ControlPlane:
             verdict, reason, rid = Verdict.DENY, "outside charter scope", None
         elif est_cost > rec.charter.escalate_above:
             verdict, reason, rid = Verdict.ESCALATE, "above autonomous threshold", None
+        elif (self.in_doubt_exposure(agent=agent) >= self.in_doubt_cap
+              or self.in_doubt_exposure(charter_id=charter_id) >= self.in_doubt_cap):
+            verdict, reason, rid = Verdict.DENY, "in-doubt exposure cap reached: resolve before new spend", None
         else:
             rid, blocker = self.reserve(charter_id, est_cost)
             if rid:
                 verdict, reason = Verdict.ALLOW, "within purpose, scope, time, and budget"
                 rec.last_activity = now
+                self.leases[rid] = {"agent": agent, "expires": now + self.lease_days}
             else:
                 verdict, reason = Verdict.DENY, f"envelope exhausted at {blocker}"
         self.ledger.append("decision", agent=agent, charter=charter_id, action=action,
@@ -283,25 +300,46 @@ class ControlPlane:
             self.reservations[rid] = (charter_id, amount)
             return rid, None
 
-    def commit(self, rid: str, actual: Decimal) -> None:
+    def commit(self, rid: str, actual: Decimal, source: str = "agent") -> None:
         """Convert escrow to spend and release the remainder. An overrun is real
-        money already gone: it is booked, recorded, and the charter is suspended."""
+        money already gone: it is booked, recorded, and the charter is suspended.
+        Idempotent: a retried confirmation for the same reservation is never booked twice."""
         with self._lock:
-            charter_id, amount = self.reservations.pop(rid)
-            for node in self._chain(charter_id):
-                node.reserved -= amount
-                node.committed += actual
+            duplicate = rid in self.settled
+            if not duplicate:
+                charter_id, amount = self.reservations.pop(rid)
+                for node in self._chain(charter_id):
+                    node.reserved -= amount
+                    node.committed += actual
+                self.settled[rid] = ("committed", actual)
+                self.in_doubt.pop(rid, None)
+        if duplicate:
+            self.ledger.append("outcome.duplicate", reservation=rid, source=source)
+            return
         self.ledger.append("outcome", reservation=rid, charter=charter_id,
-                           reserved=str(amount), actual=str(actual))
+                           reserved=str(amount), actual=str(actual), source=source)
         if actual > amount:
             self.suspend(charter_id, f"overrun: spent {actual} against {amount}")
 
     def release(self, rid: str) -> None:
+        """Return escrow unspent. Only on evidence that nothing was spent."""
         with self._lock:
+            if rid in self.settled:
+                return
             charter_id, amount = self.reservations.pop(rid)
             for node in self._chain(charter_id):
                 node.reserved -= amount
+            self.settled[rid] = ("released",)
+            self.in_doubt.pop(rid, None)
         self.ledger.append("released", reservation=rid, charter=charter_id)
+
+    def in_doubt_exposure(self, agent: str | None = None, charter_id: str | None = None) -> Decimal:
+        total = ZERO
+        for rid in self.in_doubt:
+            cid, amount = self.reservations[rid]
+            if (agent and self.leases.get(rid, {}).get("agent") == agent) or (charter_id and cid == charter_id):
+                total += amount
+        return total
 
     # -- 4. evidence-based stage gates
     def attest(self, charter_id: str, evidence: str, by: str, now: int) -> None:
@@ -366,10 +404,28 @@ class ControlPlane:
                 eac = f"{m['EAC']:.0f}" if m["EAC"] else "unbounded"
                 findings.append(("COST_TRAJECTORY", cid,
                                  f"CPI {m['CPI']:.2f}, EAC {eac} vs budget {c.budget}"))
+        # Unconfirmed reservations. Silence is never evidence: a reservation whose lease
+        # expired, or whose charter stopped, moves to IN_DOUBT and stays encumbered as
+        # if spent until the system of record says what actually happened.
         for rid, (cid, _) in list(self.reservations.items()):
-            if any(r.state is not State.ACTIVE for r in self._chain(cid)):
+            stopped = any(r.state is not State.ACTIVE for r in self._chain(cid))
+            expired = now > self.leases.get(rid, {}).get("expires", now)
+            if rid not in self.in_doubt and (stopped or expired):
+                self.in_doubt[rid] = now
+                findings.append(("IN_DOUBT", cid, f"{rid} unconfirmed: held as spent"))
+            if rid not in self.in_doubt:
+                continue
+            outcome = self.system_of_record(rid) if self.system_of_record else None
+            if outcome is None:
+                if now - self.in_doubt[rid] >= self.escalate_after:
+                    owner = self.records[cid].charter.owner
+                    findings.append(("IN_DOUBT_ESCALATED", cid, f"{rid} unresolved: escalated to {owner}"))
+            elif outcome == ZERO:
                 self.release(rid)
-                findings.append(("ORPHAN_RESERVATION", cid, f"{rid} released"))
+                findings.append(("ORPHAN_RESERVATION", cid, f"{rid} confirmed not spent: released"))
+            else:
+                self.commit(rid, outcome, source="system_of_record")
+                findings.append(("IN_DOUBT_RESOLVED", cid, f"{rid} confirmed spent {outcome}: committed"))
         for kind, cid, detail in findings:
             self.ledger.append("reconcile.finding", finding=kind, charter=cid,
                                detail=detail, day=now)
