@@ -26,4 +26,5 @@ isolation, least-privilege tokens, signed ledger entries, and an append-only sto
 
    - **Part 1: Every Agent Action Needs a Reason.** Decision provenance and enforcement at the moment of action. Code: `decision_gate.py` (repository root).
    - **Part 2: The PMO Is Becoming a Control Plane.** Charters as code, stage gates, escrowed budgets, earned value, and reconciliation. Code: [`control-plane/`](control-plane/)
-   - **Part 3: Measuring an Agent Institution.** Coming next.
+   - **Part 3: Measuring an Agent Institution.** Scorecards from the verified ledger, metric-gaming detection, and an autonomy ladder. Code: [`control-plane/measurement.py`](control-plane/measurement.py)
+   - **Part 4: How to Fire an Agent.** Coming next.
