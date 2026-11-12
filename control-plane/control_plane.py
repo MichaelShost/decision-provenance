@@ -18,6 +18,9 @@ What it adds:
      from the system of record says otherwise (v1.1)
   9. An optional per-agent autonomy ceiling, so measured trust can tighten an
      agent's limits without amending the charter (v1.2, used by measurement.py)
+ 10. Signed evidence: systems of record are registered by a signing human and
+     sign every confirmation with a key no agent holds; unsigned or forged
+     confirmations are rejected (v1.3)
 
 Standard library only. HMAC stands in for asymmetric signatures to keep the
 example dependency free; use Ed25519 or an HSM-backed key in production.
@@ -46,6 +49,19 @@ def sha256(obj) -> str:
 
 def sign(key: bytes, payload) -> str:
     return hmac.new(key, canonical(payload), hashlib.sha256).hexdigest()
+
+
+def confirmation_payload(rid: str, actual) -> dict:
+    """What a system of record signs: this reservation, this actual cost."""
+    return {"reservation": rid, "actual": str(actual)}
+
+
+@dataclass(frozen=True)
+class Confirmation:
+    """An outcome as reported by a system of record, signed with its own key."""
+    actual: Decimal
+    source: str
+    signature: str
 
 
 class GovernanceError(Exception):
@@ -179,10 +195,13 @@ class ControlPlane:
         self.lease_days = lease_days
         self.in_doubt_cap = in_doubt_cap
         self.escalate_after = escalate_after
-        self.system_of_record = system_of_record  # rid -> actual cost, ZERO if not spent, None if unknown
+        self.system_of_record = system_of_record  # rid -> signed Confirmation, or None if unknown
         self.leases: dict[str, dict] = {}
         self.in_doubt: dict[str, int] = {}
         self.settled: dict[str, tuple] = {}
+        # Evidence sources (v1.3): a registry separate from human principals and
+        # from agents. Only a signing human can add a source.
+        self.sources = Principals()
 
     # -- lineage helpers
     def _chain(self, charter_id: str) -> list[Record]:
@@ -254,6 +273,14 @@ class ControlPlane:
         self.records[charter_id].state = State.ACTIVE
         self.ledger.append("charter.resumed", charter=charter_id, by=human)
 
+    def register_source(self, name: str, key: bytes, human: str, signature: str) -> None:
+        """Trusting a new evidence source is a human decision, recorded like any other."""
+        if not self.principals.verify(human, {"register_source": name}, signature):
+            raise GovernanceError("evidence sources are registered only by a signing human principal")
+        self.sources.register(name, key)
+        self.ledger.append("source.registered", source=name, by=human,
+                           key_fingerprint=hashlib.sha256(key).hexdigest()[:16])
+
     # -- 2. enforcement at the moment of action
     def authorize(self, agent: str, charter_id: str, presented_digest: str,
                   action: str, est_cost: Decimal, now: int, ceiling: Decimal | None = None):
@@ -307,10 +334,16 @@ class ControlPlane:
             self.reservations[rid] = (charter_id, amount)
             return rid, None
 
-    def commit(self, rid: str, actual: Decimal, source: str = "agent") -> None:
+    def commit(self, rid: str, actual: Decimal, source: str = "agent",
+               signature: str | None = None) -> None:
         """Convert escrow to spend and release the remainder. An overrun is real
         money already gone: it is booked, recorded, and the charter is suspended.
-        Idempotent: a retried confirmation for the same reservation is never booked twice."""
+        Idempotent: a retried confirmation for the same reservation is never booked twice.
+        Any source other than the agent itself must sign; a label alone proves nothing."""
+        verified = source != "agent"
+        if verified and not self.sources.verify(source, confirmation_payload(rid, actual), signature or ""):
+            self.ledger.append("evidence.rejected", reservation=rid, claimed_source=source)
+            raise GovernanceError(f"confirmation claiming source '{source}' is unsigned or invalid: rejected")
         with self._lock:
             duplicate = rid in self.settled
             if not duplicate:
@@ -324,7 +357,7 @@ class ControlPlane:
             self.ledger.append("outcome.duplicate", reservation=rid, source=source)
             return
         self.ledger.append("outcome", reservation=rid, charter=charter_id,
-                           reserved=str(amount), actual=str(actual), source=source)
+                           reserved=str(amount), actual=str(actual), source=source, verified=verified)
         if actual > amount:
             self.suspend(charter_id, f"overrun: spent {actual} against {amount}")
 
@@ -422,17 +455,22 @@ class ControlPlane:
                 findings.append(("IN_DOUBT", cid, f"{rid} unconfirmed: held as spent"))
             if rid not in self.in_doubt:
                 continue
-            outcome = self.system_of_record(rid) if self.system_of_record else None
-            if outcome is None:
+            # Pull, never relay: the reconciler asks the system of record directly.
+            conf = self.system_of_record(rid) if self.system_of_record else None
+            if conf is not None and not self.sources.verify(
+                    conf.source, confirmation_payload(rid, conf.actual), conf.signature):
+                self.ledger.append("evidence.rejected", reservation=rid, claimed_source=conf.source)
+                findings.append(("FORGED_CONFIRMATION", cid, f"{rid} confirmation failed verification: held"))
+            elif conf is None:
                 if now - self.in_doubt[rid] >= self.escalate_after:
                     owner = self.records[cid].charter.owner
                     findings.append(("IN_DOUBT_ESCALATED", cid, f"{rid} unresolved: escalated to {owner}"))
-            elif outcome == ZERO:
+            elif conf.actual == ZERO:
                 self.release(rid)
                 findings.append(("ORPHAN_RESERVATION", cid, f"{rid} confirmed not spent: released"))
             else:
-                self.commit(rid, outcome, source="system_of_record")
-                findings.append(("IN_DOUBT_RESOLVED", cid, f"{rid} confirmed spent {outcome}: committed"))
+                self.commit(rid, conf.actual, source=conf.source, signature=conf.signature)
+                findings.append(("IN_DOUBT_RESOLVED", cid, f"{rid} confirmed spent {conf.actual}: committed"))
         for kind, cid, detail in findings:
             self.ledger.append("reconcile.finding", finding=kind, charter=cid,
                                detail=detail, day=now)

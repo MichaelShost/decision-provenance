@@ -4,11 +4,16 @@ import threading
 import unittest
 from decimal import Decimal as D
 
-from control_plane import (Charter, ControlPlane, GovernanceError, Phase,
-                           Principals, State, Verdict, sign)
+from control_plane import (Charter, ControlPlane, Confirmation, GovernanceError, Phase,
+                           Principals, State, Verdict, confirmation_payload, sign)
 
 OWNER, PMO = "owner", "pmo"
 KEYS = {OWNER: b"k-owner", PMO: b"k-pmo"}
+BILLING = b"k-billing"  # held by the billing system, never by an agent
+
+
+def conf(rid, amount, key=BILLING):
+    return Confirmation(D(amount), "billing", sign(key, confirmation_payload(rid, D(amount))))
 
 
 def plane():
@@ -23,6 +28,7 @@ def plane():
     child = Charter("KID", 1, "p", "o", OWNER, frozenset({"a", "b"}), D("300"),
                     D("50"), (Phase("K1", D("300"), 8, ("k1",)),), 15, "ROOT")
     cp.issue(child, sign(KEYS[OWNER], child.body()))
+    cp.register_source("billing", BILLING, OWNER, sign(KEYS[OWNER], {"register_source": "billing"}))
     return cp, root, child
 
 
@@ -159,7 +165,7 @@ class TestEvmAndReconcile(unittest.TestCase):
 
     def test_reconcile_finds_gate_debt_and_releases_confirmed_orphans(self):
         cp, _, child = plane()
-        cp.system_of_record = lambda rid: D("0")  # system of record confirms nothing was spent
+        cp.system_of_record = lambda rid: conf(rid, "0")  # signed: nothing was spent
         cp.authorize("ag", "KID", child.digest, "a", D("10"), 1)  # reserved, never completed
         kinds = {k for k, _, _ in cp.reconcile(now=9)}
         self.assertIn("GATE_DEBT", kinds)
@@ -198,14 +204,14 @@ class TestInDoubt(unittest.TestCase):
     def test_system_of_record_commits_actual_cost(self):
         cp, _, rid = self.timed_out()
         cp.reconcile(now=3)
-        cp.system_of_record = lambda r: D("37")
+        cp.system_of_record = lambda r: conf(r, "37")
         kinds = {k for k, _, _ in cp.reconcile(now=4)}
         self.assertIn("IN_DOUBT_RESOLVED", kinds)
         self.assertEqual((cp.records["KID"].committed, cp.records["KID"].reserved), (D("37"), D("0")))
 
     def test_late_retry_is_never_booked_twice(self):
         cp, _, rid = self.timed_out()
-        cp.system_of_record = lambda r: D("37")
+        cp.system_of_record = lambda r: conf(r, "37")
         cp.reconcile(now=3)
         cp.commit(rid, D("37"))  # the agent finally confirms, after resolution
         self.assertEqual(cp.records["ROOT"].committed, D("37"))
@@ -228,6 +234,38 @@ class TestLedger(unittest.TestCase):
         self.assertTrue(cp.ledger.verify())
         cp.ledger.entries[1]["owner"] = "someone-else"
         self.assertFalse(cp.ledger.verify())
+
+
+class TestSignedEvidence(unittest.TestCase):
+    """Independence isn't a label on the evidence. It's a property of its path."""
+
+    def test_a_label_alone_is_rejected(self):
+        cp, _, child = plane()
+        _, _, rid = cp.authorize("ag", "KID", child.digest, "a", D("10"), 1)
+        with self.assertRaisesRegex(GovernanceError, "unsigned or invalid"):
+            cp.commit(rid, D("10"), source="billing")  # the agent claims independence
+        self.assertEqual(cp.records["KID"].reserved, D("10"))  # nothing booked
+        self.assertEqual(cp.ledger.entries[-1]["kind"], "evidence.rejected")
+
+    def test_signed_confirmation_is_verified(self):
+        cp, _, child = plane()
+        _, _, rid = cp.authorize("ag", "KID", child.digest, "a", D("10"), 1)
+        c = conf(rid, "9")
+        cp.commit(rid, c.actual, source=c.source, signature=c.signature)
+        self.assertTrue(cp.ledger.entries[-1]["verified"])
+
+    def test_forged_confirmation_holds_the_money(self):
+        cp, _, child = plane()
+        _, _, rid = cp.authorize("ag", "KID", child.digest, "a", D("40"), 1)
+        cp.system_of_record = lambda r: conf(r, "0", key=b"agent-guessed-key")
+        kinds = {k for k, _, _ in cp.reconcile(now=3)}
+        self.assertIn("FORGED_CONFIRMATION", kinds)
+        self.assertEqual(cp.records["KID"].reserved, D("40"))
+
+    def test_only_humans_register_sources(self):
+        cp, _, _ = plane()
+        with self.assertRaisesRegex(GovernanceError, "signing human"):
+            cp.register_source("shadow", b"k", "ag", sign(b"guess", {"register_source": "shadow"}))
 
 
 if __name__ == "__main__":

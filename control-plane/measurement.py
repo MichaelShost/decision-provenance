@@ -8,7 +8,8 @@ Part 3 of the Agent Institutions series. Builds on control_plane.py.
 Three ideas, each enforced in code:
   1. Measure only evidence agents cannot author. The scorecard is computed from
      the hash-chained ledger and refuses to run if the chain does not verify.
-     Self-reported outcomes are counted, but never as evidence toward trust.
+     Self-reported outcomes are counted, but never as evidence toward trust;
+     only confirmations signed by a registered system of record are (v1.3).
   2. Detect the ways agents game metrics (Goodhart's law): threshold hugging
      (what bankers call structuring), estimates that drift below actual cost,
      and probing outside the charter.
@@ -143,7 +144,7 @@ def scorecard(cp: ControlPlane, now: int, window: int = 30, lease_days: int = 1)
             if kind == "outcome":
                 row = by_rid[e["reservation"]][0]
                 row.outcomes += 1
-                row.independent_outcomes += e.get("source") == "system_of_record"
+                row.independent_outcomes += bool(e.get("verified"))  # signed by a registered source
                 actual, reserved = Decimal(e["actual"]), Decimal(e["reserved"])
                 row.overruns += actual > reserved
                 totals = getattr(row, "_totals", (ZERO, ZERO))

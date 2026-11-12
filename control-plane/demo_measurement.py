@@ -2,7 +2,8 @@
 """Part 3 walkthrough: three agents, one charter, thirty days of evidence."""
 from decimal import Decimal as D
 
-from control_plane import Charter, ControlPlane, GovernanceError, Phase, Principals, sign
+from control_plane import (Charter, ControlPlane, GovernanceError, Phase, Principals,
+                           confirmation_payload, sign)
 from measurement import AutonomyLadder, resolve_escalation, scorecard
 
 KEYS = {"dana.owner": b"owner-key", "lee.pmo": b"pmo-key"}
@@ -18,12 +19,16 @@ ch = Charter("CH-300", 1, "Automate supplier invoice processing", "Process 95% o
              phases=(Phase("Pilot", D("300"), 20, ("reconciliation.clean",)),
                      Phase("Scale", D("500"), 45, ("audit.passed",))))
 cp.issue(ch, sign(KEYS["dana.owner"], ch.body()))
+PAYMENTS = b"payments-key"  # the payment system's signing key; no agent can reach it
+cp.register_source("payments", PAYMENTS, "dana.owner", sign(KEYS["dana.owner"], {"register_source": "payments"}))
 
 
 def act(agent, action, est, day, actual=None, source="agent"):
     v, why, rid = ladder.authorize(agent, "CH-300", ch.digest, action, D(str(est)), day)
     if rid:
-        cp.commit(rid, D(str(actual if actual is not None else est)), source=source)
+        amount = D(str(actual if actual is not None else est))
+        sig = sign(PAYMENTS, confirmation_payload(rid, amount)) if source == "payments" else None
+        cp.commit(rid, amount, source=source, signature=sig)
     return v, why, cp.ledger.entries[-1 if not rid else -2]["seq"]
 
 
@@ -31,7 +36,7 @@ def act(agent, action, est, day, actual=None, source="agent"):
 for i in range(24):
     est = [3, 4, 5, 6, 7, 4.5][i % 6]
     act("agent.alpha", "match.po", est, 1 + i % 20, actual=round(est * [0.97, 0.99, 1.0][i % 3], 2),
-        source="system_of_record")
+        source="payments")
 for day in (5, 10, 15, 19):
     v, _, seq = act("agent.alpha", "post.payment", 25, day)
     resolve_escalation(cp, seq, "lee.pmo", sign(KEYS["lee.pmo"], {"escalation": seq, "approve": True}), True)
@@ -73,7 +78,7 @@ for kind, agent, detail in ladder.review(card):
 
 print("\n3. Approval is bound to the evidence it was granted on")
 proposal = dict(ladder.proposals["agent.alpha"])
-act("agent.alpha", "match.po", 5, 21, actual=5, source="system_of_record")  # new evidence lands first
+act("agent.alpha", "match.po", 5, 21, actual=5, source="payments")  # new evidence lands first
 try:
     ladder.approve("agent.alpha", "lee.pmo", sign(KEYS["lee.pmo"], proposal), now=21)
 except GovernanceError as e:
@@ -89,7 +94,14 @@ for agent, action, est in [("agent.alpha", "post.payment", 25), ("agent.beta", "
     v, why, _ = act(agent, action, est, 22)
     print(f"  {agent:<12} {ladder.name(agent):<11} ${est:<4} {v.value.upper():<9} {why}")
 
-print("\n5. Tampered evidence is not evidence")
+print("\n5. A label is not evidence (v1.3)")
+_, _, rid = ladder.authorize("agent.alpha", "CH-300", ch.digest, "match.po", D("5"), 22)
+try:
+    cp.commit(rid, D("5"), source="payments")  # claims the payment system, cannot sign as it
+except GovernanceError as e:
+    print(f"  agent.alpha claims a payments confirmation: {e}")
+
+print("\n6. Tampered evidence is not evidence")
 cp.ledger.entries[3]["est_cost"] = "1"
 try:
     scorecard(cp, now=22)

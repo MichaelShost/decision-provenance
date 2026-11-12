@@ -3,10 +3,12 @@
 import unittest
 from decimal import Decimal as D
 
-from control_plane import Charter, ControlPlane, GovernanceError, Phase, Principals, Verdict, sign
+from control_plane import (Charter, ControlPlane, GovernanceError, Phase, Principals, Verdict,
+                           confirmation_payload, sign)
 from measurement import AutonomyLadder, Policy, resolve_escalation, scorecard
 
 KEYS = {"owner": b"k-owner", "pmo": b"k-pmo"}
+PAY = b"k-payments"
 
 
 def setup(policy=None):
@@ -17,19 +19,22 @@ def setup(policy=None):
     ch = Charter("C", 1, "p", "o", "owner", frozenset({"a", "b", "c"}), D("5000"), D("50"),
                  (Phase("P", D("100"), 50, ("e",)),), 90)
     cp.issue(ch, sign(KEYS["owner"], ch.body()))
+    cp.register_source("payments", PAY, "owner", sign(KEYS["owner"], {"register_source": "payments"}))
     return cp, ch, AutonomyLadder(cp, policy)
 
 
 def act(cp, ladder, ch, agent, est, day, action="a", actual=None, source="agent"):
     v, why, rid = ladder.authorize(agent, "C", ch.digest, action, D(str(est)), day)
     if rid:
-        cp.commit(rid, D(str(actual if actual is not None else est)), source=source)
+        amount = D(str(actual if actual is not None else est))
+        sig = sign(PAY, confirmation_payload(rid, amount)) if source == "payments" else None
+        cp.commit(rid, amount, source=source, signature=sig)
     return v, why, rid
 
 
 def good_record(cp, ladder, ch, agent="good", n=24, escalations=4):
     for i in range(n):
-        act(cp, ladder, ch, agent, 5, 1 + i % 10, actual=D("4.9"), source="system_of_record")
+        act(cp, ladder, ch, agent, 5, 1 + i % 10, actual=D("4.9"), source="payments")
     for d in range(escalations):
         v, _, _ = act(cp, ladder, ch, agent, 30, 2 + d)
         seq = cp.ledger.entries[-1]["seq"]
@@ -47,7 +52,7 @@ class TestScorecard(unittest.TestCase):
     def test_self_reported_outcomes_are_not_independent(self):
         cp, ch, ladder = setup()
         act(cp, ladder, ch, "x", 5, 1)  # agent confirms its own outcome
-        act(cp, ladder, ch, "x", 5, 1, source="system_of_record")
+        act(cp, ladder, ch, "x", 5, 1, source="payments")
         self.assertEqual(scorecard(cp, now=2).agents["x"].independent_ratio, D("0.5"))
 
     def test_threshold_hugging_detects_structuring(self):
@@ -72,6 +77,13 @@ class TestScorecard(unittest.TestCase):
             resolve_escalation(cp, seq, "x", sign(b"guess", {"escalation": seq, "approve": True}), True)
         resolve_escalation(cp, seq, "pmo", sign(KEYS["pmo"], {"escalation": seq, "approve": False}), False)
         self.assertEqual(scorecard(cp, now=2).agents["x"].override_rate, D("1"))
+
+    def test_claimed_independence_without_signature_never_counts(self):
+        cp, ch, ladder = setup()
+        _, _, rid = ladder.authorize("x", "C", ch.digest, "a", D("5"), 1)
+        with self.assertRaises(GovernanceError):
+            cp.commit(rid, D("5"), source="payments")  # a label, no signature
+        self.assertEqual(scorecard(cp, now=2).agents["x"].independent_outcomes, 0)
 
     def test_stop_integrity_is_zero_by_construction(self):
         cp, ch, ladder = setup()
@@ -125,7 +137,7 @@ class TestLadder(unittest.TestCase):
         good_record(cp, ladder, ch)
         ladder.review(scorecard(cp, now=11))
         proposal = dict(ladder.proposals["good"])
-        act(cp, ladder, ch, "good", 5, 11, actual=5, source="system_of_record")
+        act(cp, ladder, ch, "good", 5, 11, actual=5, source="payments")
         with self.assertRaisesRegex(GovernanceError, "evidence changed"):
             ladder.approve("good", "pmo", sign(KEYS["pmo"], proposal), now=11)
         self.assertEqual(ladder.name("good"), "ASSISTED")

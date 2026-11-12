@@ -34,7 +34,7 @@ Requires Python 3.10 or later. Standard library only, no installs.
 ```bash
 python demo.py               # Part 2: nine scenarios, end to end
 python demo_measurement.py   # Part 3: three agents, thirty days of evidence
-python -m unittest -v        # 35 tests across both modules
+python -m unittest -v        # 40 tests across both modules
 ```
 
 The demo walks through delegation that cannot widen, agent self-chartering rejected, graded verdicts, change control that invalidates stale versions, stage gates with separation of duties, forty agents racing for one budget, parent suspension cascading to children, continuous earned value with reconciliation findings, tamper detection, and a timed-out action held in doubt until the system of record resolves it.
@@ -61,6 +61,16 @@ What happens when an agent reserves budget, acts, then times out and never confi
 
 See scenario 9 in `demo.py` and `TestInDoubt` in `test_control_plane.py`. Thanks to Kiran Yenaganti, whose question about agents that time out mid-action prompted this revision.
 
+## Independence is a property of the path, not a label (v1.3)
+
+Part 3 counts only evidence agents cannot author. That rule is only as strong as the proof of where evidence came from, so independence is enforced cryptographically, the way financial auditors send confirmations directly to the bank rather than through the client:
+
+- **Pull, never relay.** The reconciler queries the system of record by the action's idempotency key. The agent never carries its own evidence.
+- **A separate credential.** Each system of record signs every confirmation (reservation and actual cost) with its own key, which no agent holds. The control plane rejects any confirmation that claims an independent source without a valid signature, records the rejection, and keeps the money held.
+- **Sources are registered by humans.** Adding a trusted evidence source requires a signing human principal and is written to the ledger with the key's fingerprint, so the list of trusted sources is itself auditable.
+
+The scorecard counts an outcome as independent only if its signature verified. See `TestSignedEvidence` in `test_control_plane.py` and scenario 5 in `demo_measurement.py`. Thanks to Walfred Alaniz, whose question about who audits the independence of evidence sources prompted this revision.
+
 ## Measuring an agent institution (Part 3)
 
 `measurement.py` answers the question every executive asks next: when do agents deserve more autonomy, and when less?
@@ -84,12 +94,12 @@ This is a reference implementation written for clarity, not a production library
 
 | File | Purpose |
 |---|---|
-| `control_plane.py` | The control plane (about 440 lines) |
+| `control_plane.py` | The control plane (about 480 lines) |
 | `demo.py` | Part 2 scenario walkthrough |
-| `test_control_plane.py` | 20 tests, including the concurrency proof and in-doubt handling |
+| `test_control_plane.py` | 24 tests, including the concurrency proof, in-doubt handling, and signed evidence |
 | `measurement.py` | Part 3: scorecard, gaming detection, and the autonomy ladder (about 280 lines) |
 | `demo_measurement.py` | Part 3 scenario walkthrough |
-| `test_measurement.py` | 15 tests, including evidence-bound promotions |
+| `test_measurement.py` | 16 tests, including evidence-bound promotions |
 
 ## The series
 

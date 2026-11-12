@@ -3,8 +3,8 @@
 import threading
 from decimal import Decimal as D
 
-from control_plane import (Charter, ControlPlane, GovernanceError, Phase,
-                           Principals, sign)
+from control_plane import (Charter, ControlPlane, Confirmation, GovernanceError, Phase,
+                           Principals, confirmation_payload, sign)
 
 KEYS = {"dana.owner": b"owner-key", "lee.pmo": b"pmo-key"}
 people = Principals()
@@ -132,6 +132,8 @@ print(f"  after editing one historical entry, chain verifies: {cp.ledger.verify(
 print("\n9. Timeouts don't release money. Evidence does. (v1.1)")
 records = {}  # stand-in for the tool's system of record, keyed by idempotency key
 cp2 = ControlPlane(people, in_doubt_cap=D("25"), system_of_record=lambda rid: records.get(rid))
+PAYMENTS = b"payments-key"  # held by the payment system; no agent can reach it
+cp2.register_source("payments", PAYMENTS, "dana.owner", sign(KEYS["dana.owner"], {"register_source": "payments"}))
 ops = Charter("CH-200", 1, "Vendor data refresh", "Refresh supplier records nightly", "dana.owner",
               frozenset({"call.api"}), budget=D("100"), escalate_above=D("50"), expires=30, phases=())
 cp2.issue(ops, sign(KEYS["dana.owner"], ops.body()))
@@ -142,7 +144,8 @@ for kind, cid, detail in cp2.reconcile(now=3):
 print(f"  CH-200 still encumbered: ${cp2.records['CH-200'].reserved} held as spent, nothing released")
 show("agent.sync tries new spend while in doubt",
      cp2.authorize("agent.sync", "CH-200", ops.digest, "call.api", D("5"), now=3))
-records[rid] = D("22")  # the provider's ledger shows the call did happen
+records[rid] = Confirmation(D("22"), "payments",  # the provider's ledger shows the call happened
+                            sign(PAYMENTS, confirmation_payload(rid, D("22"))))
 for kind, cid, detail in cp2.reconcile(now=4):
     print(f"  day 4  {kind:<20} {detail}")
 cp2.commit(rid, D("22"))  # the agent's late retry arrives
