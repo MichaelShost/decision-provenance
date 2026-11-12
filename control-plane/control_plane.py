@@ -16,6 +16,8 @@ What it adds:
   7. A hash-chained, tamper-evident ledger
   8. In-doubt handling: a timed-out action is treated as spent until evidence
      from the system of record says otherwise (v1.1)
+  9. An optional per-agent autonomy ceiling, so measured trust can tighten an
+     agent's limits without amending the charter (v1.2, used by measurement.py)
 
 Standard library only. HMAC stands in for asymmetric signatures to keep the
 example dependency free; use Ed25519 or an HSM-backed key in production.
@@ -254,8 +256,11 @@ class ControlPlane:
 
     # -- 2. enforcement at the moment of action
     def authorize(self, agent: str, charter_id: str, presented_digest: str,
-                  action: str, est_cost: Decimal, now: int):
+                  action: str, est_cost: Decimal, now: int, ceiling: Decimal | None = None):
         rec = self.records.get(charter_id)
+        limit = None
+        if rec is not None:  # the effective threshold: the tighter of charter and agent tier
+            limit = rec.charter.escalate_above if ceiling is None else min(rec.charter.escalate_above, ceiling)
         if rec is None:
             verdict, reason, rid = Verdict.DENY, "no charter: orphan work", None
         elif presented_digest != rec.charter.digest:
@@ -267,8 +272,10 @@ class ControlPlane:
             verdict, reason, rid = Verdict.DENY, "authority lease expired", None
         elif action not in rec.charter.actions:
             verdict, reason, rid = Verdict.DENY, "outside charter scope", None
-        elif est_cost > rec.charter.escalate_above:
-            verdict, reason, rid = Verdict.ESCALATE, "above autonomous threshold", None
+        elif est_cost > limit:
+            reason = ("above autonomous threshold" if limit == rec.charter.escalate_above
+                      else "above agent autonomy tier")
+            verdict, rid = Verdict.ESCALATE, None
         elif (self.in_doubt_exposure(agent=agent) >= self.in_doubt_cap
               or self.in_doubt_exposure(charter_id=charter_id) >= self.in_doubt_cap):
             verdict, reason, rid = Verdict.DENY, "in-doubt exposure cap reached: resolve before new spend", None
@@ -281,8 +288,8 @@ class ControlPlane:
             else:
                 verdict, reason = Verdict.DENY, f"envelope exhausted at {blocker}"
         self.ledger.append("decision", agent=agent, charter=charter_id, action=action,
-                           est_cost=str(est_cost), verdict=verdict.value,
-                           reason=reason, reservation=rid, day=now)
+                           est_cost=str(est_cost), limit=None if limit is None else str(limit),
+                           verdict=verdict.value, reason=reason, reservation=rid, day=now)
         return verdict, reason, rid
 
     # -- 3. hierarchical budget envelopes with escrow
